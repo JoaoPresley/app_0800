@@ -1,0 +1,10 @@
+# do python
+*__pycache__*
+*.venv
+*.idea
+
+# variaveis privadas
+*.env
+
+# de teste
+*teste*
