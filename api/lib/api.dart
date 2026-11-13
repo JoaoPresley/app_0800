@@ -16,6 +16,7 @@ class Api {
   late final String user;
   late final String password;
 
+  // Constructor
   Api() {
     // 1. Carrega as credenciais do .env
     final env = DotEnv(includePlatformEnvironment: true)..load(['../.env']);
@@ -52,48 +53,63 @@ class Api {
   }
 
   /// Passo 1: Handshake OIDC até atingir a página de login com o parâmetro 'rf'
-  Future<bool> initSession() async {
+  Future<bool> _initSession() async {
     String currentUrl = 'https://ifs10pro.msgas.com.br:48080/main/ifsapplications/web/';
 
     try {
       // 1. Inicia requisição
-      for (int step = 1; step <= 3; step++) {
-        final response = await _dio.get(currentUrl);
+      var response = await _dio.get(currentUrl);
+      response = await _redirect(response);
+      // Se encontrou a tela de login (200 OK)
+      if (response.statusCode == 200) {
+        loginUrl = response.realUri.toString();
 
-        // Se encontrou a tela de login (200 OK)
-        if (response.statusCode == 200) {
-          loginUrl = currentUrl;
-          if (currentUrl.contains('rf=')) {
-            currentRf = Uri.parse(currentUrl).queryParameters['rf'];
-          }
-          return true;
+        if (response.realUri.toString().contains('rf=')) {
+          currentRf = response.realUri.queryParameters['rf'];
         }
-
-        // Se for redirecionamento (301, 302, 303, 307)
-        final location = response.headers.value('location');
-        if (location != null &&
-            (response.statusCode == 301 ||
-             response.statusCode == 302 ||
-             response.statusCode == 303 ||
-             response.statusCode == 307)) {
-          final uri = Uri.parse(currentUrl).resolve(location);
-          currentUrl = uri.toString();
-        } else {
-          print('Interrompido no handshake com status: ${response.statusCode}');
-          return false;
-        }
+        return true;
+      }else{
+        print("Erro ao encontrar página ${response.statusCode}");
+        return false;
       }
-      print('Realizada 3 redirecionamentos e não foi encontrado tela de login');
-      return false;
     } catch (e) {
       print('Erro ao obter sessão: $e');
       return false;
     }
   }
 
+  /// Trata redirecionamentos HTTP (301, 302, 303, 307, 308)
+  Future<Response> _redirect(Response response) async {
+    // Primeiro status
+    int status = response.statusCode ?? 0;
+    int breaker = 0;
+    // Enquanto tiver redirecionamento ele redireciona
+    while ( status == 301 ||
+            status == 302 ||
+            status == 303 ||
+            status == 307 ||
+            status == 308) {
+              // Se ocorrera 4 interações para
+              if (breaker>4) break;
+              breaker++;
+              // Realiza o redirecionamento
+              final location = response.headers.value('location');
+              if (location != null && location.isNotEmpty) {
+                final currentUri = response.realUri;
+                final targetUri = currentUri.resolve(location);
+                response = await _dio.getUri(targetUri);
+              }else{
+                return response;
+              }
+              status = response.statusCode ?? 0;
+    }
+    // Se não tiver redirecionamento retorna o própio response
+    return response;
+  }
+
   /// Passo 2: Executa o POST de login com usuário e senha do .env e processa a cadeia de callbacks
   Future<void> login() async {
-    final initialized = await initSession();
+    final initialized = await _initSession();
     if (!initialized || loginUrl == null || currentRf == null) {
       print('Falha ao inicializar a sessão do login.');
       return;
@@ -116,50 +132,32 @@ class Api {
         ),
       );
 
-      String currentUrl = loginUrl!;
-
       // 3. Processa a sequência de callbacks pós-login (Location 302 e OIDC Form Post)
-      for (int step = 1; step <= 6; step++) {
-        final location = response.headers.value('location');
+      response = await _redirect(response);
 
-        // Redireciona
-        //  Se for um redirecionamento comum
-        if (location != null &&
-            (response.statusCode == 301 ||
-             response.statusCode == 302 ||
-             response.statusCode == 303 ||
-             response.statusCode == 307)) {
-          final nextUri = Uri.parse(currentUrl).resolve(location);
-          currentUrl = nextUri.toString();
-          response = await _dio.get(currentUrl);
-          // Se o redirecionamento estiver no corpo da requisição
-        } else if (response.statusCode == 200 && response.data.toString().contains('<form')) {
-          // O OIDC costuma devolver uma página com um formulário auto-post (id_token, state)
-          final body = response.data.toString();
-          final actionMatch = RegExp(r'<form[^>]*action=[\x22\x27]([^\x22\x27]*)[\x22\x27]').firstMatch(body);
+      // Trata o redirecionamento OIDC via Form Auto-Post, se retornado
+      if (response.statusCode == 200 && response.data.toString().contains('<form')) {
+        final body = response.data.toString();
+        final actionMatch = RegExp(r'<form[^>]*action=[\x22\x27]([^\x22\x27]*)[\x22\x27]').firstMatch(body);
 
-          if (actionMatch != null) {
-            final action = actionMatch.group(1)!;
-            final callbackUrl = Uri.parse(currentUrl).resolve(action).toString();
+        if (actionMatch != null) {
+          final action = actionMatch.group(1)!;
+          final callbackUrl = response.realUri.resolve(action).toString();
 
-            final Map<String, String> formData = {};
-            final inputMatches = RegExp(r'<input[^>]*name=[\x22\x27]([^\x22\x27]*)[\x22\x27][^>]*value=[\x22\x27]([^\x22\x27]*)[\x22\x27]').allMatches(body);
-            for (var m in inputMatches) {
-              formData[m.group(1)!] = m.group(2)!;
-            }
-
-            response = await _dio.post(
-              callbackUrl,
-              data: formData,
-              options: Options(contentType: Headers.formUrlEncodedContentType),
-            );
-            currentUrl = callbackUrl;
-          } // Se não foi um status 30x ou 200 com form não é redirecionamento
-           else {
-            break;
+          final Map<String, String> formData = {};
+          final inputMatches = RegExp(r'<input[^>]*name=[\x22\x27]([^\x22\x27]*)[\x22\x27][^>]*value=[\x22\x27]([^\x22\x27]*)[\x22\x27]').allMatches(body);
+          for (var m in inputMatches) {
+            formData[m.group(1)!] = m.group(2)!;
           }
-        } else {
-          break;
+
+          response = await _dio.post(
+            callbackUrl,
+            data: formData,
+            options: Options(contentType: Headers.formUrlEncodedContentType),
+          );
+
+          // Segue eventuais redirecionamentos após o POST do form OIDC
+          response = await _redirect(response);
         }
       }
     } catch (e) {
@@ -167,5 +165,20 @@ class Api {
     }
   }
 
-  
+  Future<String> horas() async {
+    print('Começou');
+    // Link da API
+    final url = Uri.parse("https://ifs10pro.msgas.com.br:48080/main/ifsapplications/projection/v1/WorkTaskClockingsHandling.svc/JtTaskClockingSet");
+    // requisição
+    var response = await _dio.getUri(url);
+    response = await _redirect(response);
+
+    if (response.statusCode == 200) {
+      print("Tudo deu certo");
+    } else {
+      print('Não foi, $response');
+    }
+
+    return response.data.toString();
+  }
 }
