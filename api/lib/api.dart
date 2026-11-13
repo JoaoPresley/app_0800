@@ -13,13 +13,30 @@ class Api {
   String? loginUrl;
   String? xsrfToken;
 
+  bool get isAuthenticated => xsrfToken != null;
+
+  /// Garante que exista uma sessão autenticada antes de qualquer chamada
+  Future<bool> ensureAuthenticated() async {
+    if (isAuthenticated) return true;
+    return await login();
+  }
+
   late final String user;
   late final String password;
 
   // Constructor
   Api() {
-    // 1. Carrega as credenciais do .env
-    final env = DotEnv(includePlatformEnvironment: true)..load(['../.env']);
+    // 1. Carrega as credenciais do .env (tenta local ou diretório acima)
+    final env = DotEnv(includePlatformEnvironment: true);
+    if (File('.env').existsSync()) {
+      env.load(['.env']);
+    } else if (File('api/.env').existsSync()) {
+      env.load(['api/.env']);
+    } else if (File('../.env').existsSync()) {
+      env.load(['../.env']);
+    } else {
+      env.load();
+    }
     user = env['USERNAME'] ?? '';
     password = env['PASSWORD'] ?? '';
 
@@ -108,14 +125,15 @@ class Api {
   }
 
   /// Passo 2: Executa o POST de login com usuário e senha do .env e processa a cadeia de callbacks
-  Future<void> login() async {
+  Future<bool> login() async {
+    print("Iniciado Login");
     final initialized = await _initSession();
     if (!initialized || loginUrl == null || currentRf == null) {
       print('Falha ao inicializar a sessão do login.');
-      return;
+      return false;
     }
 
-    //2. Enviando credenciais (POST) para: $loginUrl
+    // 2. Enviando credenciais (POST) para: $loginUrl
     try {
       var response = await _dio.post(
         loginUrl!,
@@ -160,23 +178,115 @@ class Api {
           response = await _redirect(response);
         }
       }
+
+      // 4. Captura o cookie XSRF-TOKEN salvo no CookieJar
+      print("Buscando cookies");
+      final baseUri = Uri.parse('https://ifs10pro.msgas.com.br:48080');
+      final cookies = await _cookieJar.loadForRequest(baseUri);
+      for (var cookie in cookies) {
+        if (cookie.name == 'XSRF-TOKEN') {
+          print("Encontrado cookie");
+          xsrfToken = cookie.value;
+          _dio.options.headers['X-XSRF-TOKEN'] = xsrfToken;
+          break;
+        }
+      }
+
+      // Se não caiu de volta na tela de login com rf=, login foi um sucesso
+      final finalUrl = response.realUri.toString();
+      if (!finalUrl.contains('login?rf=')) {
+        return true;
+      } else {
+        print('Falha de login: redirecionado de volta para o login. Verifique usuário e senha.');
+        return false;
+      }
     } catch (e) {
       print('Erro no fluxo de login: $e');
+      return false;
     }
   }
 
-  Future<String> horas() async {
-    print('Começou');
-    // Link da API
-    final url = Uri.parse("https://ifs10pro.msgas.com.br:48080/main/ifsapplications/projection/v1/WorkTaskClockingsHandling.svc/JtTaskClockingSet");
-    // requisição
-    var response = await _dio.getUri(url);
+  /// Método genérico para requisições GET autenticadas e resilientes
+  Future<Response> getData(String url) async {
+    print("Realizando requisição $url");
+    await ensureAuthenticated();
+
+    var response = await _dio.get(url);
     response = await _redirect(response);
+
+    // Se a sessão expirou ou redirecionou de volta pro login
+    if (response.realUri.toString().contains('login?rf=') || response.statusCode == 401) {
+      print('Sessão expirada ou não autenticada. Renovando login...');
+      xsrfToken = null;
+      final reconnected = await login();
+      if (reconnected) {
+        response = await _dio.get(url);
+        response = await _redirect(response);
+      }
+    }
+
+    return response;
+  }
+
+  /// Método genérico para requisições POST autenticadas e resilientes
+  Future<Response> postData(String url, {dynamic data, Map<String, dynamic>? headers}) async {
+    await ensureAuthenticated();
+
+    Options? options;
+    if (headers != null) {
+      options = Options(headers: headers);
+    }
+
+    var response = await _dio.post(url, data: data, options: options);
+    response = await _redirect(response);
+
+    // Se a sessão expirou ou redirecionou de volta pro login
+    if (response.realUri.toString().contains('login?rf=') || response.statusCode == 401) {
+      print('Sessão expirada ou não autenticada. Renovando login...');
+      xsrfToken = null;
+      final reconnected = await login();
+      if (reconnected) {
+        response = await _dio.post(url, data: data, options: options);
+        response = await _redirect(response);
+      }
+    }
+
+    return response;
+  }
+
+  /// Método genérico para requisições PATCH autenticadas e resilientes
+  Future<Response> patchData(String url, {dynamic data, Map<String, dynamic>? headers}) async {
+    await ensureAuthenticated();
+
+    Options? options;
+    if (headers != null) {
+      options = Options(headers: headers);
+    }
+
+    var response = await _dio.patch(url, data: data, options: options);
+    response = await _redirect(response);
+
+    if (response.realUri.toString().contains('login?rf=') || response.statusCode == 401) {
+      print('Sessão expirada ou não autenticada. Renovando login...');
+      xsrfToken = null;
+      final reconnected = await login();
+      if (reconnected) {
+        response = await _dio.patch(url, data: data, options: options);
+        response = await _redirect(response);
+      }
+    }
+
+    return response;
+  }
+
+  Future<String> horas() async {
+    const url = "https://ifs10pro.msgas.com.br:48080/main/ifsapplications/projection/v1/WorkTaskClockingsHandling.svc/JtTaskClockingSet";
+    final response = await getData(url);
 
     if (response.statusCode == 200) {
       print("Tudo deu certo");
     } else {
-      print('Não foi, $response');
+      print('Não foi: ${response.statusCode} - ${response.realUri}');
     }
 
     return response.data.toString();

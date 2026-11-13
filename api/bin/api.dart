@@ -1,5 +1,6 @@
-import 'package:api/api.dart' as api;
+import '../lib/api.dart';
 
-void main(List<String> arguments) {
-  print('Hello world: ${api.calculate()}!');
+void main(List<String> arguments) async {
+  final api = Api();
+  await api.horas();
 }

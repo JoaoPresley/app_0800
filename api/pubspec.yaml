@@ -10,6 +10,10 @@ environment:
 dependencies:
   path: ^1.9.0
   http: ^1.6.0
+  dio: ^5.11.1
+  cookie_jar: ^4.0.9
+  dio_cookie_manager: ^3.5.0
+  dotenv: ^4.2.0
 
 dev_dependencies:
   lints: ^6.0.0
