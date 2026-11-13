@@ -1,86 +1,94 @@
-import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
+import 'package:cookie_jar/cookie_jar.dart';
+import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
+import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 
 class Api {
-  final HttpClient _client;
-  // Armazena os cookies entre os redirecionamentos
-  final Map<String, String> _cookies = {};
+  late final Dio _dio;
+  late final CookieJar _cookieJar;
 
-  Api({HttpClient? client}) : _client = client ?? HttpClient() {
-    // Caso o certificado SSL da rede interna precise ser aceito:
-    _client.badCertificateCallback = (X509Certificate cert, String host, int port) => true;
-  }
-
-  // Atributos para consulta posterior
-  Map<String, String> get cookies => _cookies;
   String? currentRf;
 
-  Future<void> login() async {
-    final initialUrl = Uri.parse('https://ifs10pro.msgas.com.br:48080/main/ifsapplications/web/');
+  Api() {
+    _dio = Dio(
+      BaseOptions(
+        headers: {
+          'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept':
+              'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        // O segredo: desabilitamos followRedirects para o interceptor de cookies salvar o cookie a cada 302!
+        followRedirects: false,
+        validateStatus: (status) => status != null && status < 600,
+      ),
+    );
+
+    _cookieJar = CookieJar();
+    _dio.interceptors.add(CookieManager(_cookieJar));
+
+    // Certificado SSL corporativo
+    _dio.httpClientAdapter = IOHttpClientAdapter(
+      createHttpClient: () {
+        final client = HttpClient();
+        client.badCertificateCallback = (cert, host, port) => true;
+        return client;
+      },
+    );
+  }
+
+  /// Inicia o fluxo OAuth/OIDC seguindo os redirects e coletando o cookie de sessão e o parâmetro 'rf'
+  Future<void> initSession() async {
+    String currentUrl = 'https://ifs10pro.msgas.com.br:48080/main/ifsapplications/web/';
 
     try {
-      print('1. Acessando URL inicial...');
-      Uri currentUrl = initialUrl;
-      String? rf;
+      // Iniciando HandShake para login
+      for (int step = 1; step <= 4; step++) { // Máxima de 3 interações
+        // 1. Obtem a resposta da requisição
+        final response = await _dio.get(currentUrl);
 
-      // Segue os redirecionamentos acumulando cookies e capturando parâmetros de URL
-      for (int i = 0; i < 10; i++) {
-        final request = await _client.getUrl(currentUrl);
-        request.followRedirects = false; // Controlamos o redirect manualmente
+        // 1.1. Se a resposta foi positiva..
+        if (response.statusCode == 200) {
+          // Faz o POST com o usuário e senha
+          //  1.1.1 Link do login
+          final location = response.headers.value('location').toString();
+          final uri = Uri.parse(currentUrl).resolve(location);
+          
 
-        // Envia os cookies acumulados
-        if (_cookies.isNotEmpty) {
-          final cookieHeader = _cookies.entries.map((e) => '${e.key}=${e.value}').join('; ');
-          request.headers.set(HttpHeaders.cookieHeader, cookieHeader);
+          return;
         }
 
-        final response = await request.close();
-
-        // 1. Armazena cookies recebidos no header Set-Cookie
-        for (var cookie in response.cookies) {
-          _cookies[cookie.name] = cookie.value;
-        }
-
-        print('[$i] Status: ${response.statusCode} -> URL: $currentUrl');
-
-        // Se a URL possuir o parâmetro 'rf', guardamos
-        if (currentUrl.queryParameters.containsKey('rf')) {
-          rf = currentUrl.queryParameters['rf'];
-          currentRf = rf;
-          print('>>> Parâmetro rf encontrado: $rf');
-        }
-
-        // Verifica se é redirecionamento (301, 302, 303, 307)
-        if (response.isRedirect ||
-            response.statusCode == 301 ||
-            response.statusCode == 302 ||
-            response.statusCode == 303 ||
-            response.statusCode == 307) {
-          final location = response.headers.value(HttpHeaders.locationHeader);
-          if (location == null) {
-            print('Redirecionamento sem header Location.');
-            break;
-          }
-
-          // Resolve URLs relativas caso necessário
-          currentUrl = currentUrl.resolve(location);
-          print('    Redirecionando para: $currentUrl');
-        } else if (response.statusCode == 200) {
-          final body = await response.transform(utf8.decoder).join();
-          print('Página de Login carregada com sucesso! (${body.length} caracteres)');
-          break;
+        // 1.2 Se foi um redirecionamento..
+        final location = response.headers.value('location'); //Obtem link do redirecionamento
+        if (location != null &&
+            (response.statusCode == 301 ||
+             response.statusCode == 302 ||
+             response.statusCode == 303 ||
+             response.statusCode == 307)) {
+          // Nova requisição
+          final uri = Uri.parse(currentUrl).resolve(location);
+          currentUrl = uri.toString();
         } else {
-          print('Status não tratado: ${response.statusCode}');
-          break;
+          throw Exception('EXCEPTION: Interrompido com status: ${response.statusCode}');
         }
       }
-
-      print('\n--- Resumo ---');
-      print('RF capturado: $currentRf');
-      print('Cookies capturados: $_cookies');
+      // Se realizou 3 interações e não conseguiu fazer o login
+      throw Exception("EXCEPTION: 3 redirecionamentos realizado e não conseguiu realizar o login...");
     } catch (e) {
-      print("Erro durante o fluxo: $e");
+      print('Erro ao obter sessão: $e');
     }
+  }
+
+  /// Exemplo de chamada de login (submissão de credenciais com o rf capturado)
+  Future<void> login() async {
+    final success = await initSession();
+    if (!success || currentRf == null) {
+      print('Falha ao inicializar sessão para login.');
+      return;
+    }
+
+    print('Pronto para submeter usuário e senha com rf=$currentRf!');
   }
 }
