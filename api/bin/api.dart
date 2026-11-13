@@ -9,4 +9,5 @@ void main(List<String> arguments) async {
   final resp = await api.getData('https://ifs10pro.msgas.com.br:48080/main/ifsapplications/projection/v1/WorkTaskClockingsHandling.svc/JtTaskClockingSet?\$top=5');
   stopwatch.stop();
   print(stopwatch.elapsedMilliseconds);
+  print(api.isAuthenticated);
 }
